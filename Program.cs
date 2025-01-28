@@ -1,5 +1,18 @@
-﻿using Serilog;
+﻿using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
+using ReverseProxyLoadBalance.Context;
+using ReverseProxyLoadBalance.Entities;
+using ReverseProxyLoadBalance.Implements;
+using ReverseProxyLoadBalance.Repositories;
+using Serilog;
+using Serilog.Events;
+using Serilog.Exceptions;
 using Spectre.Console;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace ReverseProxyLoadBalance;
 
@@ -11,26 +24,98 @@ public class Program
 
         WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
 
-        builder.WebHost.UseUrls("http://localhost:5000", "https://localhost:6000");
+        builder.WebHost.UseUrls("http://localhost:5000");
 
-        builder.Configuration.AddJsonFile("appsettings.json", optional: false, reloadOnChange: true);
+        builder.Configuration
+            .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+            .AddUserSecrets<Program>()
+            .Build();
 
-        Log.Logger = new LoggerConfiguration().ReadFrom.Configuration(builder.Configuration).CreateLogger();
+        Log.Logger = new LoggerConfiguration()
+            .MinimumLevel.Information()
+             .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
+            .MinimumLevel.Override("Microsoft.AspNetCore.HttpLogging.HttpLoggingMiddleware", LogEventLevel.Warning)
+            .ReadFrom.Configuration(builder.Configuration)
+            .WriteTo.Console()
+            .Enrich.WithExceptionDetails()
+            .CreateLogger();
+
+        builder.Host.UseSerilog(Log.Logger);
+
+        builder.Services.AddDbContext<ApplicationDbContext>(options =>
+        options.UseInMemoryDatabase("InMemoryDb"));
+
+        builder.Services.AddIdentity<User, IdentityRole>()
+            .AddEntityFrameworkStores<ApplicationDbContext>()
+            .AddDefaultTokenProviders();
 
         builder.Services.AddReverseProxy()
             .LoadFromConfig(builder.Configuration.GetSection("ReverseProxy"));
 
-        builder.Host.UseSerilog();
+        Byte[] secretJwtToken = Encoding.ASCII.GetBytes(builder.Configuration.GetSection("JwtToken:Secret").Value ?? String.Empty);
+        builder.Services.AddAuthentication(options =>
+        {
+            options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+            options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+        }).AddJwtBearer(options =>
+        {
+            options.TokenValidationParameters = new TokenValidationParameters
+            {
+                ValidateIssuerSigningKey = true,
+                IssuerSigningKey = new SymmetricSecurityKey(secretJwtToken),
+                ValidateIssuer = false,
+                ValidateAudience = false,
+            };
+        });
+
+        builder.Services.AddScoped<IUserRepository, UserRepository>();
+        builder.Services.AddTransient<IPasswordHasher<User>, BCryptPasswordHasher>();
+
+        builder.Services.AddControllers()
+            .AddJsonOptions(options =>
+            {
+                options.JsonSerializerOptions.DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull;
+                options.JsonSerializerOptions.WriteIndented = true;
+                options.JsonSerializerOptions.RespectNullableAnnotations = true;
+                options.JsonSerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower;
+            });
+
+        builder.Services.AddAuthorization();
 
         builder.Services.AddControllers();
 
+        builder.Services.AddEndpointsApiExplorer();
+        builder.Services.AddSwaggerGen();
+
         WebApplication app = builder.Build();
 
-        app.UseHttpsRedirection();
+        //app.UseSerilogRequestLogging();
+
+        app.UseAuthentication();
+        app.UseAuthorization();
+
+        //app.UseHttpsRedirection();
 
         app.MapReverseProxy();
 
-        app.Run();
+        if (app.Environment.IsDevelopment())
+        {
+            app.SeedDatabase();
+            app.UseSwagger();
+            app.UseSwaggerUI();
+        }
+
+        app.MapControllers();
+
+        try
+        {
+            app.Run();
+        }
+        finally
+        {
+            Log.Information("Server shutting down...");
+            Log.CloseAndFlush();
+        }
 
     }
 
