@@ -89,8 +89,6 @@ public class Program
 
         WebApplication app = builder.Build();
 
-        //app.UseSerilogRequestLogging();
-
         app.UseAuthentication();
         app.UseAuthorization();
 
